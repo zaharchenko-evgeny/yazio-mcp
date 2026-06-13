@@ -3,7 +3,7 @@
 import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { Yazio } from 'yazio';
+import { Yazio, YazioAuth } from 'yazio';
 import { v4 as uuidv4 } from "uuid";
 
 const require = createRequire(import.meta.url);
@@ -44,6 +44,8 @@ import type {
 class YazioMcpServer {
   private server: McpServer;
   private yazioClient: Yazio | null = null;
+  private yazioAuth: YazioAuth | null = null;
+  private initialization: Promise<void>;
 
   constructor() {
     this.server = new McpServer({
@@ -54,7 +56,7 @@ class YazioMcpServer {
     this.setupToolHandlers();
     this.setupPromptHandlers();
     this.setupErrorHandling();
-    this.initializeClient();
+    this.initialization = this.initializeClient();
   }
 
   private async initializeClient(): Promise<void> {
@@ -68,49 +70,21 @@ class YazioMcpServer {
     }
 
     try {
-      this.yazioClient = new Yazio({
+      this.yazioAuth = new YazioAuth({
         credentials: {
           username,
           password
         }
       });
+      this.yazioClient = new Yazio(this.yazioAuth);
       // Test the connection
       await this.yazioClient.user.get();
       console.error('✅ Successfully authenticated with Yazio using environment variables');
-      this.extendWaterIntakeSupport(this.yazioClient);
     } catch (error) {
       console.error('❌ Failed to authenticate with Yazio:', (error as Error).message);
       console.error('💡 Please check your YAZIO_USERNAME and YAZIO_PASSWORD environment variables');
       process.exit(1);
     }
-  }
-
-  // Extend yazio client package with addWaterIntake method
-  // Discussion https://github.com/juriadams/yazio/issues/3
-  private extendWaterIntakeSupport(client: Yazio): void {
-    // @ts-expect-error - Monkey-patching yazio client to add missing method
-    client.user.addWaterIntake = async (entries: YazioAddWaterIntakeOptions): Promise<void> => {
-      // @ts-expect-error - Accessing internal auth token from yazio client
-      const token = client.auth.token.access_token;
-
-      // Access internal HTTP client or make direct fetch call
-      // Try to access base URL from client, fallback to known API URL
-      const baseUrl = (client as Yazio & { baseUrl?: string }).baseUrl || 'https://yzapi.yazio.com/v15';
-
-      const response = await fetch(`${baseUrl}/user/water-intake`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify(entries),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to add water intake: ${response.status} ${response.statusText} - ${errorText}`);
-      }
-    };
   }
 
   private setupErrorHandling(): void {
@@ -491,10 +465,38 @@ Example:
   }
 
   private async ensureAuthenticated(): Promise<Yazio> {
+    await this.initialization;
     if (!this.yazioClient) {
       throw new Error('Yazio client not initialized. Check environment variables.');
     }
     return this.yazioClient;
+  }
+
+  private async ensureAuth(): Promise<YazioAuth> {
+    await this.initialization;
+    if (!this.yazioAuth) {
+      throw new Error('Yazio auth not initialized. Check environment variables.');
+    }
+    return this.yazioAuth;
+  }
+
+  private async addWaterIntake(entries: YazioAddWaterIntakeOptions): Promise<void> {
+    const auth = await this.ensureAuth();
+    const token = await auth.authenticate();
+
+    const response = await fetch('https://yzapi.yazio.com/v15/user/water-intake', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token.access_token}`,
+      },
+      body: JSON.stringify(entries),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to add water intake: ${response.status} ${response.statusText} - ${errorText}`);
+    }
   }
 
 
@@ -703,9 +705,14 @@ Example:
     const client = await this.ensureAuthenticated();
 
     try {
+      const serving = args.serving ?? null;
+      const serving_quantity = args.serving_quantity ?? null;
+
       await client.user.addConsumedItem({
         ...args,
         id: uuidv4(),
+        serving,
+        serving_quantity,
       });
 
       return {
@@ -741,11 +748,8 @@ Example:
   }
 
   private async addUserWaterIntake(args: AddWaterIntakeInput) {
-    const client = await this.ensureAuthenticated();
-
     try {
-      // @ts-expect-error - Using monkey-patched method
-      await client.user.addWaterIntake([{
+      await this.addWaterIntake([{
         date: args.date, // Already in "YYYY-MM-DD HH:mm:ss" format
         water_intake: args.water_intake,
       }]);
@@ -803,6 +807,7 @@ Example:
 
 
   async run(): Promise<void> {
+    await this.initialization;
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.error('Yazio MCP server running on stdio');
