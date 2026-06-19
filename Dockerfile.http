@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1
+#
+# HTTP variant of the Yazio MCP image.
+#
+# The upstream Dockerfile runs the server over stdio (for local Claude Desktop).
+# This variant builds the same compiled server but exposes it over Streamable
+# HTTP using supergateway, so it can run as a long-lived container behind the
+# OAuth gateway. The stdio Dockerfile is left untouched.
+#
+#   Endpoint:  http://<container>:8000/mcp
+#   Health:    http://<container>:8000/healthz
+
+############################
+# Stage 1 — build (dev deps)
+############################
+FROM node:22-alpine AS build
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+RUN npm prune --omit=dev --ignore-scripts
+
+############################
+# Stage 2 — runtime
+############################
+FROM node:22-alpine AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+
+# Bake supergateway into the image so nothing is fetched from the network at
+# container start (more reliable + works with a locked-down egress policy).
+RUN npm install -g supergateway@^3 \
+    && npm cache clean --force
+
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package.json ./package.json
+
+# Files copied from the build context can carry restrictive (0600) perms,
+# which the unprivileged 'node' user then can't read. Make /app readable.
+RUN chmod -R a+rX /app
+
+USER node
+
+EXPOSE 8000
+
+# Stateful mode keeps ONE persistent stdio child per session. In stateless mode
+# supergateway spawns a fresh `node` child per request and does not reap them,
+# so they accumulate (gateway polls, healthchecks, Hermes) and leak memory until
+# the host OOMs. Stateful (as used by the zepp image) keeps the process count
+# bounded. YAZIO_USERNAME / YAZIO_PASSWORD come from env_file (.env) at runtime.
+ENTRYPOINT ["supergateway", \
+  "--stdio", "node /app/dist/index.js", \
+  "--outputTransport", "streamableHttp", \
+  "--streamableHttpPath", "/mcp", \
+  "--stateful", \
+  "--sessionTimeout", "1800000", \
+  "--port", "8000", \
+  "--healthEndpoint", "/healthz", \
+  "--logLevel", "info"]
