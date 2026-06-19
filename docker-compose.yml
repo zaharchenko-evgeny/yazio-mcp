@@ -1,0 +1,59 @@
+# Hardened, isolated runtime for the (unofficial) Yazio MCP server.
+#
+# This is a *stdio* MCP server: it talks to the MCP client over stdin/stdout,
+# not a network port. So you don't "docker compose up" it like a web service —
+# the MCP client launches it on demand. Use this file to BUILD the image and to
+# encode the isolation profile; see README-DOCKER.md for the client config.
+#
+#   Build:                docker compose build
+#   Manual smoke test:    docker compose run --rm yazio-mcp   (Ctrl-C to exit)
+
+services:
+  yazio-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yazio-mcp:local
+    container_name: yazio-mcp
+
+    # Credentials are read from a local .env file you create (see .env.example).
+    # They are NEVER baked into the image.
+    env_file:
+      - .env
+
+    # --- Isolation / hardening ---------------------------------------------
+    # No inbound ports. stdio only.
+    stdin_open: true
+    tty: false
+
+    # Run as the unprivileged 'node' user (also set in the Dockerfile).
+    user: "node"
+
+    # Block privilege escalation (setuid binaries, sudo, etc.).
+    security_opt:
+      - no-new-privileges:true
+
+    # Drop every Linux capability — this server needs none of them.
+    cap_drop:
+      - ALL
+
+    # Immutable root filesystem. The app writes nothing to disk; if a future
+    # dependency needs scratch space, give it an explicit tmpfs (below).
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    # Resource ceilings so a runaway/compromised process can't exhaust the host.
+    mem_limit: 256m
+    pids_limit: 128
+    cpus: 0.5
+
+    # Outbound network is required (HTTPS to Yazio's API). It cannot be set to
+    # 'none' or auth will fail. No inbound exposure exists. To restrict egress
+    # further, see the firewall note in README-DOCKER.md.
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
